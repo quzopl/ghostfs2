@@ -27,6 +27,7 @@ int gh_dev_create(const char *path, uint64_t total_blocks, struct gh_dev *dev) {
     dev->checksums = 0; dev->csum_start = 0; dev->csum_blocks = 0;
     dev->jrnl_start = 0; dev->jrnl_blocks = 0;
     dev->v2_ncache = NULL;
+    dev->v2_rcache = NULL;
     return 0;
 }
 
@@ -55,6 +56,7 @@ int gh_dev_open(const char *path, struct gh_dev *dev) {
     dev->checksums = 0; dev->csum_start = 0; dev->csum_blocks = 0;
     dev->jrnl_start = 0; dev->jrnl_blocks = 0;
     dev->v2_ncache = NULL;
+    dev->v2_rcache = NULL;
     return 0;
 }
 

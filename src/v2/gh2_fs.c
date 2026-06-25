@@ -2,6 +2,7 @@
 #define _DEFAULT_SOURCE
 #include "v2/gh2_fs.h"
 #include "v2/gh2_ncache.h"
+#include "v2/gh2_rcache.h"
 #include "csum.h"
 #include "crypto.h"
 #include <string.h>
@@ -1133,6 +1134,10 @@ int gh2_fs_mount_key(struct gh2_fs *fs, struct gh_dev *dev, const char *passphra
         goto fail_cipher;
     }
     fs->alloc.ncache = fs->dev.v2_ncache;
+    /* READ-SIDE cache zweryfikowanych wezlow (csum-keyed): pomija gh_disk_read + gh_crc32 dla
+     * goracych wezlow (korzen/wewnetrzne). READ-ONLY. Brak OOM -> kontynuuj bez rcache (cache
+     * jest czysto wydajnosciowy; NULL = sciezka jak dotad). */
+    fs->dev.v2_rcache = gh2_rcache_create();
     return 0;
 
 fail_cipher:
@@ -1157,6 +1162,9 @@ void gh2_fs_unmount(struct gh2_fs *fs) {
         fs->dev.v2_ncache = NULL;
         fs->alloc.ncache = NULL;
     }
+    /* READ-SIDE cache: zwolnij (brak wycieku). NULL-safe. */
+    gh2_rcache_destroy(fs->dev.v2_rcache);
+    fs->dev.v2_rcache = NULL;
     gh2_txn_alloc_destroy(&fs->alloc);
     gh2_space_destroy(&fs->space);
     if (fs->dev.cipher) {   /* v2enc: wymaz klucz przy odmontowaniu (brak wycieku) */

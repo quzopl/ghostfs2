@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 #include "v2/gh2_btree.h"
 #include "v2/gh2_ncache.h"
+#include "v2/gh2_rcache.h"
 #include "csum.h"
 #include <string.h>
 #include <stdlib.h>
@@ -115,13 +116,29 @@ int gh2_node_read(struct gh_dev *dev, const struct gh2_bptr *bptr, void *buf) {
         if (bptr->dup_block != 0 && gh2_ncache_get(nc, bptr->dup_block, buf))
             return gh2_node_validate(buf);
     }
-    int r = gh_disk_read(dev, bptr->block, buf);
-    if (r == 0 && gh_crc32(buf, GH2_BLOCK_SIZE) == bptr->csum)
+    /* READ-SIDE CACHE (csum-keyed): zweryfikowany wezel z pamieci pomija gh_disk_read + gh_crc32.
+     * HIT tylko gdy zapisany csum == bptr->csum -> NIGDY nie zwroci starej tresci dla reuzytego
+     * (CoW) bloku o nowym csum. Self-coherent: cache trzyma juz-zweryfikowana tresc. */
+    struct gh2_rcache *rc = dev->v2_rcache;
+    if (rc && gh2_rcache_get(rc, bptr->block, bptr->csum, buf))
         return gh2_node_validate(buf);
+    int r = gh_disk_read(dev, bptr->block, buf);
+    if (r == 0) {
+        gh2_node_crc_verify_count++;                 /* test-only: weryfikacja CRC wezla (MISS) */
+        if (gh_crc32(buf, GH2_BLOCK_SIZE) == bptr->csum) {
+            int vr = gh2_node_validate(buf);
+            /* po UDANEJ weryfikacji glownego bloku -> wstaw do read-cache (tylko gdy struktura
+             * tez OK; zly strukturalnie wezel = -EIO, nie cache'ujemy). */
+            if (vr == 0 && rc) gh2_rcache_put(rc, bptr->block, bptr->csum, buf);
+            return vr;
+        }
+    }
     /* niezgodnosc lub blad I/O -> sprobuj duplikatu (jesli istnieje) */
     if (bptr->dup_block != 0) {
         r = gh_disk_read(dev, bptr->dup_block, buf);
-        if (r == 0 && gh_crc32(buf, GH2_BLOCK_SIZE) == bptr->csum) {
+        if (r == 0) {
+            gh2_node_crc_verify_count++;
+            if (gh_crc32(buf, GH2_BLOCK_SIZE) == bptr->csum) {
             int vr = gh2_node_validate(buf);
             if (vr == 0) {
                 /* READ-REPAIR (v2.8, best-effort): kopia `block` byla zla, `dup_block` dobra.
@@ -129,8 +146,11 @@ int gh2_node_read(struct gh_dev *dev, const struct gh2_bptr *bptr, void *buf) {
                  * — odczyt i tak zwraca poprawne dane z dup. Przepisujemy TE SAMA tresc (csum
                  * niezmienione), wiec snapshot-share nienaruszony (to naprawa, nie CoW). */
                 (void)gh_disk_write(dev, bptr->block, buf);
+                /* dobra tresc pod bptr->block (csum bptr) -> cache'uj (kolejne odczyty hit). */
+                if (rc) gh2_rcache_put(rc, bptr->block, bptr->csum, buf);
             }
             return vr;
+            }
         }
     }
     return -EIO;

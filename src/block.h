@@ -28,7 +28,8 @@ struct gh_dev { int fd; uint64_t total_blocks; struct gh_txn *txn;
                 uint64_t hint_block; uint64_t hint_inode; struct gh_bcache *cache;
                 int is_blkdev; uint64_t *discards; uint32_t nd; uint32_t dcap;
                 int checksums; uint64_t csum_start, csum_blocks, jrnl_start, jrnl_blocks;
-                void *v2_ncache; /* ghostfs v2: write-back cache brudnych wezlow (NULL=off) */ };
+                void *v2_ncache; /* ghostfs v2: write-back cache brudnych wezlow (NULL=off) */
+                void *v2_rcache; /* ghostfs v2: read-side cache zweryfikowanych wezlow (csum-keyed, NULL=off) */ };
 
 int  gh_bcache_create(struct gh_dev *dev);
 void gh_bcache_destroy(struct gh_dev *dev);
