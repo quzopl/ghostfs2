@@ -1,0 +1,29 @@
+name: ci
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libfuse3-dev libssl-dev zlib1g-dev attr pkg-config build-essential
+      - name: Unit tests
+        run: make test
+      - name: Tests under AddressSanitizer + UBSan
+        run: make test-asan
+      - name: Build CLI and FUSE driver
+        run: make cli fuse
+      - name: FUSE integration (if /dev/fuse is available)
+        run: |
+          if [ -e /dev/fuse ]; then
+            chmod +x tests/integration_v2.sh tests/integration.sh
+            ./tests/integration_v2.sh
+            ./tests/integration.sh
+          else
+            echo "SKIPPED: no /dev/fuse on the CI runner"
+          fi
