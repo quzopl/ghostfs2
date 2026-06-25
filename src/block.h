@@ -40,6 +40,10 @@ void gh_bcache_destroy(struct gh_dev *dev);
 extern unsigned long gh_disk_write_count;
 extern uint64_t      gh_disk_write_watch;
 extern unsigned long gh_disk_write_watch_hits;
+/* gh_disk_read_count: laczna liczba LOGICZNYCH odczytow bloku (gh_disk_read; wlacznie z trafieniami
+ * w cache) od ostatniego resetu. Mierzy liczbe odwiedzonych wezlow/blokow przy odczycie (dowod
+ * redukcji descentow range-read vs per-blok). Globalne (proces); test zeruje przed pomiarem. */
+extern unsigned long gh_disk_read_count;
 
 int  gh_dev_create(const char *path, uint64_t total_blocks, struct gh_dev *dev);
 int  gh_dev_open(const char *path, struct gh_dev *dev);

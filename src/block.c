@@ -112,8 +112,11 @@ void gh_discard_pending_add(struct gh_dev *dev, uint64_t blkno) {
 
 void gh_discard_clear(struct gh_dev *dev) { dev->nd = 0; }
 
+unsigned long gh_disk_read_count = 0;
+
 int gh_disk_read(struct gh_dev *dev, uint64_t blkno, void *buf) {
     if (blkno >= dev->total_blocks) return -EINVAL;
+    gh_disk_read_count++;
     struct gh_bcache *c = dev->cache;
     if (c && blkno != 0) {
         struct gh_bentry *e = &c->slots[blkno % c->nslots];

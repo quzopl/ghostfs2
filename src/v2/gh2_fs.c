@@ -226,6 +226,56 @@ static int data_block_read(struct gh2_fs *fs, const struct gh2_extent *e, uint8_
     return 0;
 }
 
+/* ---- v2-batchread: range-read sekwencyjny (descent RAZ na lisc) ----
+ * Zamiast extent_lookup_at (descent z korzenia) per blok 4 KB, przejdz WSZYSTKIE itemy
+ * EXTENT_DATA w zakresie odczytu JEDNYM gh2_btree_iterate_range (in-order po lisciach).
+ * Bufor wyjsciowy memset 0 -> dziury = zera. Callback kopiuje przeciecie [off,off+len) z
+ * blokiem [key.offset, key.offset+GH2_DATA_BLK). BAJT-EXACT z petla per-blok (klamra do size
+ * robiona przez callera; tu len juz <= size-off). READ-ONLY (bez mutacji). */
+struct read_range_ctx {
+    struct gh2_fs *fs;
+    uint8_t       *buf;
+    uint64_t       off;
+    size_t         len;
+    int            err;
+};
+static int read_range_cb(const struct gh2_key *key, const void *val, uint32_t len_item, void *vctx) {
+    struct read_range_ctx *c = vctx;
+    if (key->type != GH2_EXTENT_DATA) return 0;       /* defensywnie (range juz ogranicza typ) */
+    struct gh2_extent e;
+    if (extent_decode(val, len_item, &e)) { c->err = -EIO; return 1; }
+
+    uint8_t blk[GH2_DATA_BLK];
+    int r = data_block_read(c->fs, &e, blk);          /* deszyfr.+csum->dup/-EIO jak per-blok */
+    if (r) { c->err = r; return 1; }                  /* przerwij iteracje */
+
+    /* przeciecie bajtow bloku [blk_off, blk_off+GH2_DATA_BLK) z zakresem [off, off+len) */
+    uint64_t blk_off = key->offset;
+    uint64_t blk_end = blk_off + GH2_DATA_BLK;
+    uint64_t rd_off = c->off;
+    uint64_t rd_end = c->off + c->len;
+    uint64_t cs = blk_off > rd_off ? blk_off : rd_off;    /* copy_start = max(blk_off, off) */
+    uint64_t ce = blk_end < rd_end ? blk_end : rd_end;    /* copy_end   = min(blk_end, off+len) */
+    if (cs < ce) {
+        memcpy(c->buf + (cs - rd_off), blk + (cs - blk_off), (size_t)(ce - cs));
+    }
+    return 0;
+}
+
+/* odczytaj [off, off+len) pliku ino z PODANEGO root do buf (len juz sklamrowane do size przez
+ * callera). Dziury = zera. Zwraca (ssize_t)len lub -errno (csum/I/O). */
+static ssize_t fs_read_range_at(struct gh2_fs *fs, const struct gh2_bptr *root, uint64_t ino,
+                                uint8_t *buf, size_t len, uint64_t off) {
+    memset(buf, 0, len);                              /* dziury = zera domyslnie */
+    struct read_range_ctx c = { fs, buf, off, len, 0 };
+    struct gh2_key min = extent_key(ino, (off / GH2_DATA_BLK) * GH2_DATA_BLK);
+    struct gh2_key max = extent_key(ino, ((off + len - 1) / GH2_DATA_BLK) * GH2_DATA_BLK);
+    int r = gh2_btree_iterate_range(&fs->dev, root, &min, &max, read_range_cb, &c);
+    if (c.err) return c.err;
+    if (r) return r;
+    return (ssize_t)len;
+}
+
 /* ---- v2.10: batch zapis bloków danych — CoW sciezki B-drzewa RAZ na lisc (insert_run) ----
  * Bufor itemow EXTENT_DATA zbieranych przez petle zapisu (jeden item / blok 4 KB). Klucze
  * naturalnie rosnace (file_off rosnie). Wartosci = struct gh2_extent (memcpy). */
@@ -1494,25 +1544,9 @@ ssize_t gh2_fs_read_subvol(struct gh2_fs *fs, uint64_t subvol_id, const char *pa
         return (ssize_t)len;
     }
 
-    while (remaining > 0) {
-        uint64_t file_off = (pos / GH2_DATA_BLK) * GH2_DATA_BLK;
-        uint32_t boff = (uint32_t)(pos - file_off);
-        uint32_t n = GH2_DATA_BLK - boff;
-        if (n > remaining) n = (uint32_t)remaining;
-
-        struct gh2_extent e;
-        int found = (extent_lookup_at(fs, &sv.fs_root, ino, file_off, &e) == 0);
-        if (found) {
-            uint8_t blk[GH2_DATA_BLK];
-            r = data_block_read(fs, &e, blk);
-            if (r) return r;
-            memcpy(dst, blk + boff, n);
-        } else {
-            memset(dst, 0, n);
-        }
-        dst += n; pos += n; remaining -= n;
-    }
-    return (ssize_t)len;
+    /* v2-batchread: range-read (descent RAZ na lisc) zamiast extent_lookup_at per blok. */
+    (void)pos; (void)remaining; (void)dst;
+    return fs_read_range_at(fs, &sv.fs_root, ino, buf, len, off);
 }
 
 /* ============================ path resolve ============================ */
@@ -2392,25 +2426,10 @@ ssize_t gh2_fs_read(struct gh2_fs *fs, const char *path, void *buf, size_t len, 
         return (ssize_t)len;
     }
 
-    while (remaining > 0) {
-        uint64_t file_off = (pos / GH2_DATA_BLK) * GH2_DATA_BLK;
-        uint32_t boff = (uint32_t)(pos - file_off);
-        uint32_t n = GH2_DATA_BLK - boff;
-        if (n > remaining) n = (uint32_t)remaining;
-
-        struct gh2_extent e;
-        int found = (extent_lookup_at(fs, &fs->fs_root, ino, file_off, &e) == 0);
-        if (found) {
-            uint8_t blk[GH2_DATA_BLK];
-            r = data_block_read(fs, &e, blk);          /* pelne 4 KB, ogon=0; csum->EIO/dup */
-            if (r) return r;
-            memcpy(dst, blk + boff, n);
-        } else {
-            memset(dst, 0, n);                         /* dziura -> zera */
-        }
-        dst += n; pos += n; remaining -= n;
-    }
-    return (ssize_t)len;
+    /* v2-batchread: range-read (descent RAZ na lisc) zamiast extent_lookup_at per blok.
+     * BAJT-EXACT z petla per-blok: memset 0 (dziury) + przeciecie kazdego ekstentu z [off,off+len). */
+    (void)pos; (void)remaining; (void)dst;
+    return fs_read_range_at(fs, &fs->fs_root, ino, buf, len, off);
 }
 
 /* ============================ chmod / chown / utimens / truncate ============================ */
