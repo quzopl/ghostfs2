@@ -226,39 +226,61 @@ static int data_block_read(struct gh2_fs *fs, const struct gh2_extent *e, uint8_
     return 0;
 }
 
-/* CoW zapis fragmentu [boff, boff+n) bloku file_off pliku ino w lokalnym root.
- * - alokuj NOWY blok danych (CoW); gdy zapis czesciowy -> read-modify-write (odczytaj stary
- *   ekstent/zera, nalozenie src), inaczej zera + src.
- * - gh_disk_write(plaintext), csum=crc32(raw_len), insert/update EXTENT_DATA.
- * - stary disk_block (jesli ekstent istnial) -> alloc free (defer).
- * raw_len ekstentu = max(stary raw_len, boff+n) (ostatni czesciowy blok). */
-static int write_block(struct gh2_fs *fs, struct gh2_bptr *root, uint64_t ino, uint64_t file_off,
-                       const uint8_t *src, uint32_t n, uint32_t boff) {
+/* ---- v2.10: batch zapis bloków danych — CoW sciezki B-drzewa RAZ na lisc (insert_run) ----
+ * Bufor itemow EXTENT_DATA zbieranych przez petle zapisu (jeden item / blok 4 KB). Klucze
+ * naturalnie rosnace (file_off rosnie). Wartosci = struct gh2_extent (memcpy). */
+#define GH2_WRITE_BATCH  1024u    /* maks. itemow na 1 insert_run (ogromny zapis -> wsady) */
+
+struct extent_batch {
+    struct gh2_kv kv[GH2_WRITE_BATCH];
+    uint8_t       enc[GH2_WRITE_BATCH][sizeof(struct gh2_extent)];   /* zakodowane wartosci */
+    uint32_t      n;
+};
+
+/* opróżnij bufor: jeden gh2_btree_insert_run wszystkich zebranych itemow do lokalnego root. */
+static int extent_batch_flush(struct gh2_fs *fs, struct gh2_bptr *root, struct extent_batch *b) {
+    if (b->n == 0) return 0;
+    struct gh2_alloc a = gh2_txn_alloc_vtable(&fs->alloc);
+    struct gh2_bptr nroot;
+    int r = gh2_btree_insert_run(&fs->dev, &a, root, fs->sb.generation, b->kv, b->n, &nroot);
+    if (r) return r;
+    *root = nroot;
+    b->n = 0;
+    return 0;
+}
+
+/* jak write_block, ale ZAMIAST insertu do B-drzewa — dopisuje item EXTENT_DATA do bufora `b`
+ * (batch). Blok danych pisany od razu (write-through); stary blok danych przy nadpisaniu ->
+ * defer-free (jak write_block). Gdy bufor pelny -> flush (insert_run) najpierw. */
+static int write_block_batch(struct gh2_fs *fs, struct gh2_bptr *root, uint64_t ino,
+                             uint64_t file_off, const uint8_t *src, uint32_t n, uint32_t boff,
+                             struct extent_batch *b) {
     if (boff + n > GH2_DATA_BLK) return -EINVAL;
+    if (b->n == GH2_WRITE_BATCH) {
+        int fr = extent_batch_flush(fs, root, b);
+        if (fr) return fr;
+    }
 
     struct gh2_extent old; int have_old = (extent_lookup_at(fs, root, ino, file_off, &old) == 0);
 
     uint8_t blk[GH2_DATA_BLK];
     uint32_t old_raw = 0;
     if (boff != 0 || n != GH2_DATA_BLK) {
-        /* czesciowy -> RMW: zacznij od starej zawartosci (lub zer dla dziury) */
         if (have_old) {
-            int r = data_block_read(fs, &old, blk);   /* zwraca pelne 4 KB (ogon=0) */
+            int r = data_block_read(fs, &old, blk);
             if (r) return r;
             old_raw = old.raw_len; if (old_raw > GH2_DATA_BLK) old_raw = GH2_DATA_BLK;
         } else {
             memset(blk, 0, GH2_DATA_BLK);
         }
     }
-    /* nalozenie nowych bajtow */
     if (boff != 0 || n != GH2_DATA_BLK) memcpy(blk + boff, src, n);
     else memcpy(blk, src, GH2_DATA_BLK);
 
     uint32_t raw_len = boff + n;
-    if (raw_len < old_raw) raw_len = old_raw;          /* nie skracaj istniejacych danych */
+    if (raw_len < old_raw) raw_len = old_raw;
     if (raw_len > GH2_DATA_BLK) raw_len = GH2_DATA_BLK;
 
-    /* alokuj NOWY blok danych przez vtable alokatora (defer-free przy CoW) */
     struct gh2_alloc a = gh2_txn_alloc_vtable(&fs->alloc);
     uint64_t nblk = 0;
     int r = a.alloc(a.ctx, &nblk);
@@ -276,13 +298,14 @@ static int write_block(struct gh2_fs *fs, struct gh2_bptr *root, uint64_t ino, u
     ne.raw_len = raw_len;
     ne.comp_len = raw_len;
 
-    uint8_t ebuf[sizeof(struct gh2_extent)];
-    extent_encode(&ne, ebuf);
-    struct gh2_key k = extent_key(ino, file_off);
-    r = fs_insert(fs, root, &k, ebuf, sizeof(ebuf));
-    if (r) { a.free(a.ctx, nblk); return r; }          /* nowy blok -> defer (rollback cofnie) */
+    uint32_t bi = b->n;
+    extent_encode(&ne, b->enc[bi]);
+    b->kv[bi].key = extent_key(ino, file_off);
+    b->kv[bi].val = b->enc[bi];
+    b->kv[bi].len = sizeof(struct gh2_extent);
+    b->n++;
 
-    /* stary blok danych CoW -> defer_free */
+    /* stary blok danych CoW -> defer_free (jak write_block) */
     if (have_old && old.disk_block) a.free(a.ctx, old.disk_block);
     return 0;
 }
@@ -2292,6 +2315,11 @@ ssize_t gh2_fs_write(struct gh2_fs *fs, const char *path, const void *buf, size_
             src += n; pos += n; remaining -= n;
         }
     } else {
+        /* v2.10: batch — pisz bloki danych (write-through), zbieraj itemy EXTENT_DATA, JEDEN
+         * insert_run (CoW sciezki RAZ na lisc, nie na blok). Wsady <= GH2_WRITE_BATCH. */
+        struct extent_batch *b = malloc(sizeof(*b));
+        if (!b) { r = -ENOMEM; goto fail; }
+        b->n = 0;
         uint64_t pos = off;
         size_t remaining = len;
         while (remaining > 0) {
@@ -2299,10 +2327,13 @@ ssize_t gh2_fs_write(struct gh2_fs *fs, const char *path, const void *buf, size_
             uint32_t boff = (uint32_t)(pos - file_off);
             uint32_t n = GH2_DATA_BLK - boff;
             if (n > remaining) n = (uint32_t)remaining;
-            r = write_block(fs, &root, ino, file_off, src, n, boff);
-            if (r) goto fail;
+            r = write_block_batch(fs, &root, ino, file_off, src, n, boff, b);
+            if (r) { free(b); goto fail; }
             src += n; pos += n; remaining -= n;
         }
+        r = extent_batch_flush(fs, &root, b);
+        free(b);
+        if (r) goto fail;
     }
 
     /* aktualizuj rozmiar i mtime */

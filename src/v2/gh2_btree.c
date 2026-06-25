@@ -527,6 +527,293 @@ int gh2_btree_insert(struct gh_dev *dev, struct gh2_alloc *a, const struct gh2_b
     return 0;
 }
 
+/* ============================ bulk-insert (v2.10) ============================
+ *
+ * gh2_btree_insert_run: wstaw POSORTOWANY rosnaco UNIKALNY ciag itemow CoW-ujac sciezke RAZ
+ * na lisc (nie raz na item). Wynik MUSI byc IDENTYCZNY (bajt-exact zawartosc + struktura) co
+ * `n` kolejnych gh2_btree_insert. Aby to zagwarantowac, ODTWARZAMY DOKLADNIE semantyke single-
+ * insertu: itemy wstawiane po JEDNYM do biezacego "roboczego" wezla; split DOKLADNIE jak w
+ * single-insercie (lisc: leaf_split_point — najwiekszy prefiks; wezel wewn.: mid=n/2). Roznica
+ * tylko taka, ze CoW starego wezla i zapis nowych dzieje sie RAZ na (roboczy) wezel, a nie raz
+ * na item — itemy nalezace do tego samego liscia nie CoW-uja sciezki wielokrotnie.
+ *
+ * Mechanizm: rekurencja jak node_insert, ale dla SLICE itemow [lo,hi). Zwraca LISTE "kawalkow"
+ * (pieces) — po splitcie wezel rozpada sie na >1 kawalek. Kazdy kawalek: bptr + min_key (klucz
+ * do promocji w rodzicu). Stary wezel CoW-free RAZ. Rodzic wstawia kawalki dzieci po jednym,
+ * dzielac sie DOKLADNIE jak single-insert (mid=n/2 przy nadmiarze). */
+
+struct run_piece { struct gh2_bptr bptr; struct gh2_key min_key; };
+
+/* fwd-decl rekurencji */
+static int run_insert_node(struct gh_dev *dev, struct gh2_alloc *a, const struct gh2_bptr *node,
+                           uint64_t gen, const struct gh2_kv *items, uint32_t lo, uint32_t hi,
+                           struct run_piece *out, uint32_t *pnout);
+
+/* przetworz LISC `node` dla itemow [lo,hi). KROK 1: sklej PELNY posortowany zbior = istniejace
+ * itemy liscia + slice [lo,hi) (insert lub UPDATE gdy klucz istnieje — wartosc/dlugosc zmieniona).
+ * Itemy `items` sa rosnace+unikalne, istniejace tez; scalanie listowe O(nr + slice). KROK 2:
+ * PAKUJ greedy w liscie (leaf_split_point — najwiekszy prefiks <= NODE_SPACE) — IDENTYCZNIE jak
+ * sekwencja single-insertow (kazdy emitowany lisc = najwiekszy prefiks mieszczacy sie). Emituj
+ * kazdy lisc jako kawalek. Stary lisc CoW-free RAZ. */
+static int run_insert_leaf(struct gh_dev *dev, struct gh2_alloc *a, const struct gh2_bptr *node,
+                           uint64_t gen, const struct gh2_kv *items, uint32_t lo, uint32_t hi,
+                           struct run_piece *out, uint32_t *pnout) {
+    uint8_t buf[GH2_BLOCK_SIZE];
+    int r = gh2_node_read(dev, node, buf);
+    if (r) return r;
+    const struct gh2_node_hdr *h = node_hdr_c(buf);
+    const struct gh2_leaf_item *it = leaf_items_c(buf);
+    uint32_t nr = h->nritems;
+    uint64_t owner = h->owner;
+
+    /* KROK 1: scalanie posortowane istniejace (it[]) + slice (items[lo,hi)). Dane istniejacych
+     * wskazuja do `buf` (zywy przez cala funkcje), nowych do items[].val. Maks: nr + (hi-lo). */
+    uint32_t cap = nr + (hi - lo);
+    struct leaf_item_src *merged = malloc((size_t)cap * sizeof(*merged));
+    if (!merged) return -ENOMEM;
+    uint32_t mn = 0, ei = 0, si = lo;
+    while (ei < nr || si < hi) {
+        int take_existing;
+        if (ei >= nr) take_existing = 0;
+        else if (si >= hi) take_existing = 1;
+        else {
+            int c = gh2_key_cmp(&it[ei].key, &items[si].key);
+            if (c < 0) take_existing = 1;
+            else if (c > 0) take_existing = 0;
+            else {                                  /* UPDATE: klucz istnieje -> bierz nowa wartosc */
+                merged[mn].key = items[si].key;
+                merged[mn].data = (const uint8_t *)items[si].val;
+                merged[mn].len = items[si].len;
+                mn++; ei++; si++; continue;
+            }
+        }
+        if (take_existing) {
+            merged[mn].key = it[ei].key;
+            merged[mn].data = (const uint8_t *)buf + it[ei].data_off;
+            merged[mn].len = it[ei].data_len;
+            mn++; ei++;
+        } else {
+            merged[mn].key = items[si].key;
+            merged[mn].data = (const uint8_t *)items[si].val;
+            merged[mn].len = items[si].len;
+            mn++; si++;
+        }
+    }
+
+    /* KROK 2: pakuj greedy. Emituj liscie [0..sp1)[sp1..sp2)... az do konca. */
+    uint32_t start = 0;
+    while (start < mn) {
+        uint32_t remaining = mn - start;
+        uint32_t sp;
+        /* czy reszta [start..mn) miesci sie w jednym lisciu? */
+        uint32_t total = 0;
+        for (uint32_t i = start; i < mn; i++) total += merged[i].len;
+        uint32_t need = remaining * (uint32_t)sizeof(struct gh2_leaf_item) + total;
+        if (need <= GH2_NODE_SPACE) {
+            sp = remaining;                          /* caly ogon do jednego liscia */
+        } else {
+            sp = leaf_split_point(merged + start, remaining);  /* najwiekszy prefiks */
+        }
+        struct gh2_bptr lb;
+        r = leaf_build_write(dev, a, gen, owner, merged + start, sp, &lb);
+        if (r) { free(merged); return r; }
+        out[*pnout].bptr = lb; out[*pnout].min_key = merged[start].key; (*pnout)++;
+        start += sp;
+    }
+    free(merged);
+    cow_free(a, node);
+    return 0;
+}
+
+/* Wstaw POJEDYNCZY wskaznik-dziecko (key,child) do roboczej tablicy `np` (n wskaznikow) w
+ * pozycji posortowanej; jesli klucz istnieje (ten sam separator) -> PODMIEN dziecko (update
+ * sciezki). Jesli po wstawieniu n > INT_CAP -> split mid=n/2 jak single-insert: emituj LEWY
+ * kawalek do out, zostaw PRAWY jako roboczy. */
+static int run_int_add(struct gh_dev *dev, struct gh2_alloc *a, uint64_t gen, uint64_t owner,
+                       uint8_t level, struct gh2_internal_ptr *np, uint32_t *pn,
+                       const struct gh2_key *key, const struct gh2_bptr *child,
+                       struct run_piece *out, uint32_t *pnout) {
+    uint32_t n = *pn;
+    /* pozycja: pierwszy i z key[i] >= key */
+    uint32_t pos = 0;
+    while (pos < n && gh2_key_cmp(&np[pos].key, key) < 0) pos++;
+    if (pos < n && gh2_key_cmp(&np[pos].key, key) == 0) {
+        np[pos].child = *child;     /* ten sam separator -> podmien dziecko (CoW sciezki) */
+    } else {
+        for (uint32_t i = n; i > pos; i--) np[i] = np[i - 1];
+        np[pos].key = *key; np[pos].child = *child;
+        n++;
+    }
+    if (n <= GH2_INT_CAP) { *pn = n; return 0; }
+
+    /* SPLIT wezla wewnetrznego DOKLADNIE jak single-insert: lewy [0..mid), prawy [mid..n),
+     * up_key = klucz prawego[0] (min prawego poddrzewa). Jak w node_insert split: srodkowy
+     * separator idzie w gore jako min prawego kawalka. */
+    uint32_t mid = n / 2;
+    struct gh2_bptr lb;
+    int r = internal_build_write_lvl(dev, a, gen, owner, level, np, mid, &lb);
+    if (r) return r;
+    out[*pnout].bptr = lb; out[*pnout].min_key = np[0].key; (*pnout)++;
+    for (uint32_t i = 0; i + mid < n; i++) np[i] = np[mid + i];
+    *pn = n - mid;
+    return 0;
+}
+
+/* przetworz WEZEL WEWNETRZNY `node` dla itemow [lo,hi). KROK 1: dla kazdego dziecka schodzimy
+ * z pod-slice itemow, dostajemy LISTE kawalkow (dziecko moglo sie rozpasc na >1). Sklejamy
+ * pelna POSORTOWANA liste zastepczych wskaznikow `merged` (dzieci nietkniete + zastapione
+ * kawalkami). KROK 2: ODTWARZAMY single-insert — wkladamy `merged` po JEDNYM do roboczego
+ * wezla, split mid=n/2 przy nadmiarze (jak node_insert). To gwarantuje IDENTYCZNA strukture
+ * co N single-insertow (promocje ida w gore w kolejnosci rosnacej, dokladnie jak pojedyncze
+ * inserty). Stary wezel CoW-free RAZ. */
+static int run_insert_internal(struct gh_dev *dev, struct gh2_alloc *a, const struct gh2_bptr *node,
+                               uint64_t gen, const struct gh2_kv *items, uint32_t lo, uint32_t hi,
+                               struct run_piece *out, uint32_t *pnout) {
+    uint8_t buf[GH2_BLOCK_SIZE];
+    int r = gh2_node_read(dev, node, buf);
+    if (r) return r;
+    const struct gh2_node_hdr *h = node_hdr_c(buf);
+    uint8_t level = h->level;
+    uint64_t owner = h->owner;
+    uint32_t nr = h->nritems;
+    /* skopiuj wskazniki (rekurencja nadpisze buf) */
+    struct gh2_internal_ptr p[GH2_INT_CAP + 2];
+    const struct gh2_internal_ptr *pc = int_ptrs_c(buf);
+    for (uint32_t i = 0; i < nr; i++) p[i] = pc[i];
+
+    /* KROK 1: pelna posortowana lista zastepczych wskaznikow. Maks: nr dzieci, z ktorych kazde
+     * moglo sie rozpasc; ale tylko dzieci z itemami sie rozpadaja. Bezpieczna gorna granica:
+     * dla kazdego itemu max 1 dodatkowy split lisca + propagacja — w praktyce << ale alokujemy
+     * dynamicznie wg liczby itemow + dzieci. */
+    uint32_t cap = nr + (hi - lo) + 4;
+    struct gh2_internal_ptr *merged = malloc((size_t)cap * sizeof(*merged));
+    if (!merged) return -ENOMEM;
+    uint32_t mn = 0;
+
+    uint32_t i = lo;
+    uint32_t ci_prev = 0;     /* sledzi ostatnio przetworzone dziecko, by skopiowac nietkniete */
+    int started = 0;
+    while (i < hi) {
+        uint32_t ci = internal_child_idx(buf, &items[i].key);
+        /* skopiuj dzieci [ci_prev_next .. ci) bez itemow (nietkniete) */
+        uint32_t from = started ? ci_prev + 1 : 0;
+        for (uint32_t c = from; c < ci; c++) merged[mn++] = p[c];
+
+        struct gh2_key sep_hi; int has_hi = (ci + 1 < nr);
+        if (has_hi) sep_hi = p[ci + 1].key;
+        uint32_t j = i + 1;
+        while (j < hi && (!has_hi || gh2_key_cmp(&items[j].key, &sep_hi) < 0)) j++;
+
+        /* dziecko (lisc) moze rozpasc sie na <= (istniejace itemy liscia) + (itemy slice) + 1
+         * kawalkow. Gorna granica istniejacych itemow liscia = GH2_NODE_SPACE/sizeof(item). */
+        uint32_t kcap = (j - i) + (GH2_NODE_SPACE / (uint32_t)sizeof(struct gh2_leaf_item)) + 2;
+        struct run_piece *kids = malloc((size_t)kcap * sizeof(*kids));
+        if (!kids) { free(merged); return -ENOMEM; }
+        uint32_t nk = 0;
+        r = run_insert_node(dev, a, &p[ci].child, gen, items, i, j, kids, &nk);
+        if (r) { free(kids); free(merged); return r; }
+        for (uint32_t k = 0; k < nk; k++) {
+            merged[mn].key = kids[k].min_key;
+            merged[mn].child = kids[k].bptr;
+            mn++;
+        }
+        free(kids);
+        ci_prev = ci; started = 1;
+        i = j;
+    }
+    /* skopiuj pozostale dzieci za ostatnim przetworzonym (nietkniete) */
+    for (uint32_t c = ci_prev + 1; c < nr; c++) merged[mn++] = p[c];
+
+    /* KROK 2: odtworz single-insert — wkladaj merged[] po jednym, split mid=n/2 przy nadmiarze */
+    struct gh2_internal_ptr np[GH2_INT_CAP + 4];
+    uint32_t cn = 0;
+    for (uint32_t k = 0; k < mn; k++) {
+        r = run_int_add(dev, a, gen, owner, level, np, &cn,
+                        &merged[k].key, &merged[k].child, out, pnout);
+        if (r) { free(merged); return r; }
+    }
+    free(merged);
+
+    struct gh2_bptr nb;
+    r = internal_build_write_lvl(dev, a, gen, owner, level, np, cn, &nb);
+    if (r) return r;
+    out[*pnout].bptr = nb; out[*pnout].min_key = np[0].key; (*pnout)++;
+    cow_free(a, node);
+    return 0;
+}
+
+static int run_insert_node(struct gh_dev *dev, struct gh2_alloc *a, const struct gh2_bptr *node,
+                           uint64_t gen, const struct gh2_kv *items, uint32_t lo, uint32_t hi,
+                           struct run_piece *out, uint32_t *pnout) {
+    uint8_t buf[GH2_BLOCK_SIZE];
+    int r = gh2_node_read(dev, node, buf);
+    if (r) return r;
+    if (node_hdr_c(buf)->level == 0)
+        return run_insert_leaf(dev, a, node, gen, items, lo, hi, out, pnout);
+    return run_insert_internal(dev, a, node, gen, items, lo, hi, out, pnout);
+}
+
+int gh2_btree_insert_run(struct gh_dev *dev, struct gh2_alloc *a, const struct gh2_bptr *root,
+                         uint64_t gen, const struct gh2_kv *items, uint32_t n,
+                         struct gh2_bptr *out_root) {
+    if (n == 0) { *out_root = *root; return 0; }
+    /* wartosc za duza -> -EFBIG ZANIM cokolwiek wstawimy (atomowo: *out_root nietkniety) */
+    for (uint32_t i = 0; i < n; i++)
+        if (items[i].len > GH2_LEAF_MAX_VAL) return -EFBIG;
+#ifndef NDEBUG
+    /* debug: caller gwarantuje posortowanie rosnace + unikalnosc */
+    for (uint32_t i = 1; i < n; i++) {
+        int c = gh2_key_cmp(&items[i - 1].key, &items[i].key);
+        if (c >= 0) return -EINVAL;
+    }
+#endif
+
+    /* bufor kawalkow korzenia: gdy korzen to lisc, moze rozpasc sie na <= (itemy liscia)+(n)+1
+     * kawalkow; gdy wewnetrzny — mniej. Gorna granica bezpieczna. */
+    uint32_t pcap = n + (GH2_NODE_SPACE / (uint32_t)sizeof(struct gh2_leaf_item)) + 2;
+    struct run_piece *pieces = malloc((size_t)pcap * sizeof(*pieces));
+    if (!pieces) return -ENOMEM;
+    uint32_t npieces = 0;
+    int r = run_insert_node(dev, a, root, gen, items, 0, n, pieces, &npieces);
+    if (r) { free(pieces); return r; }
+
+    /* zbuduj nowe korzenie az do jednego (jak single-insert: korzen split -> nowy poziom). */
+    while (npieces > 1) {
+        /* poziom nowego korzenia = poziom kawalkow + 1 */
+        uint8_t cb[GH2_BLOCK_SIZE];
+        r = gh2_node_read(dev, &pieces[0].bptr, cb);
+        if (r) { free(pieces); return r; }
+        uint8_t child_level = node_hdr_c(cb)->level;
+        uint64_t owner = node_hdr_c(cb)->owner;
+
+        /* wstaw kawalki po jednym do roboczej tablicy korzenia (split mid=n/2 jak single).
+         * Liczba wynikowych kawalkow tego poziomu <= npieces (maleje przy kazdym poziomie). */
+        struct run_piece *out = malloc((size_t)(npieces + 1) * sizeof(*out));
+        if (!out) { free(pieces); return -ENOMEM; }
+        uint32_t nout = 0;
+        struct gh2_internal_ptr np[GH2_INT_CAP + 4];
+        uint32_t cn = 0;
+        for (uint32_t k = 0; k < npieces; k++) {
+            r = run_int_add(dev, a, gen, owner, (uint8_t)(child_level + 1), np, &cn,
+                            &pieces[k].min_key, &pieces[k].bptr, out, &nout);
+            if (r) { free(out); free(pieces); return r; }
+        }
+        struct gh2_bptr nb;
+        r = internal_build_write_lvl(dev, a, gen, owner, (uint8_t)(child_level + 1), np, cn, &nb);
+        if (r) { free(out); free(pieces); return r; }
+        out[nout].bptr = nb; out[nout].min_key = np[0].key; nout++;
+
+        for (uint32_t k = 0; k < nout; k++) pieces[k] = out[k];
+        npieces = nout;
+        free(out);
+    }
+
+    struct gh2_bptr final = pieces[0].bptr;
+    free(pieces);
+    *out_root = final;
+    return 0;
+}
+
 /* ============================ delete (Task 3) ============================
  *
  * CoW delete z pelnym rebalansowaniem (borrow/merge). Rekurencja schodzi do liscia

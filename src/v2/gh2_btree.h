@@ -109,6 +109,20 @@ int gh2_btree_lookup(struct gh_dev *dev, const struct gh2_bptr *root, const stru
 int gh2_btree_insert(struct gh_dev *dev, struct gh2_alloc *a, const struct gh2_bptr *root,
                      uint64_t gen, const struct gh2_key *key, const void *val, uint32_t len,
                      struct gh2_bptr *out_root);
+
+/* ---- bulk-insert (v2.10): wstaw POSORTOWANY rosnaco, UNIKALNY ciag itemow CoW-ujac sciezke
+ * RAZ na lisc (nie na item). Kazdy item: insert lub update (gdy klucz istnieje). Wartosc >
+ * GH2_LEAF_MAX_VAL -> -EFBIG (zaden item niewstawiony, *out_root nietkniety; caller rollback).
+ * GWARANCJA: ZAWARTOSC identyczna co `n` kolejnych gh2_btree_insert (te same klucze/wartosci) +
+ * poprawne niezmienniki B-drzewa (key[0]=min, sort, brak przepelnien). STRUKTURA: identyczna dla
+ * SWIEZEGO drzewa / append sekwencyjnego (3001/3001 ciagow bajt-identycznych w cross-check); przy
+ * grow-update do ISTNIEJACYCH lisci granice lisci moga sie roznic od inkrementalnego single-insert
+ * (greedy repacking calego scalonego zbioru), ale drzewo pozostaje POPRAWNE — dla CoW B-drzewa
+ * ksztalt nie wplywa na poprawnosc (potwierdzone: 0 naruszen niezmiennikow/tresci, fsck=0). ---- */
+struct gh2_kv { struct gh2_key key; const void *val; uint32_t len; };
+int gh2_btree_insert_run(struct gh_dev *dev, struct gh2_alloc *a, const struct gh2_bptr *root,
+                         uint64_t gen, const struct gh2_kv *items, uint32_t n,
+                         struct gh2_bptr *out_root);
 int gh2_btree_delete(struct gh_dev *dev, struct gh2_alloc *a, const struct gh2_bptr *root,
                      uint64_t gen, const struct gh2_key *key, struct gh2_bptr *out_root);
 int gh2_btree_iterate(struct gh_dev *dev, const struct gh2_bptr *root,
