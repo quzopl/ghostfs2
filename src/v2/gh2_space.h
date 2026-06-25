@@ -51,8 +51,19 @@ struct gh2_txn_alloc {
     uint64_t *defer_dec;   uint32_t ndd, ddcap;   /* bloki CoW/zwalniane: dec po commicie */
     uint64_t *defer_inc;   uint32_t ndi, dicap;   /* bloki do inc po commicie (snapshot, Task 3) */
     uint64_t *txn_alloced; uint32_t nta, tacap;   /* zaalokowane w txn (rc=1): cofnac przy abort */
+    /* v2-ncache redukcja: bloki cached-z-POPRZEDNIEJ-op (this txn) CoW-zastapione w BIEZACEJ op.
+     * Wciaz w cache (rollback-safety: stary fs_root moze na nie wskazac). Po SUKCESIE biezacej op
+     * (gh2_txn_alloc_op_commit, wolane przy nastepnym mark/commit) -> usun z cache (NIE flush) +
+     * zwolnij blok. Po ROLLBACK biezacej op -> porzuc liste (wezly zostaja w cache). */
+    uint64_t *superseded;  uint32_t nss, sscap;   /* superseded prior-op cached nodes biezacej op */
     int oom;                                       /* 1 = ENOMEM realloc (alloc zwroci blad) */
     int dup_meta;                                  /* v2.8: przekazywane do gh2_alloc (DUP metadane) */
+    void *ncache;  /* write-back cache brudnych wezlow (gh2_ncache*; NULL=off). Free vtable:
+                    * blok W cache I alokowany W BIEZACEJ operacji (>= op_floor) -> usun z cache
+                    * + immediate free (reuse); inaczej (committed / cached-z-poprzedniej-op-tej-
+                    * txn / dane) -> defer_dec. Cached blok z POPRZEDNIEJ op NIE moze byc
+                    * immediate-free (rollback biezacej op musi go odtworzyc). */
+    uint32_t op_floor;  /* indeks txn_alloced na poczatku biezacej operacji (savepoint.nta) */
 };
 
 int  gh2_txn_alloc_init(struct gh2_txn_alloc *t, struct gh2_space *s);
@@ -65,6 +76,13 @@ void gh2_txn_alloc_defer_inc(struct gh2_txn_alloc *t, uint64_t blk);
 void gh2_txn_alloc_defer_dec(struct gh2_txn_alloc *t, uint64_t blk);
 int  gh2_txn_alloc_commit(struct gh2_txn_alloc *t);   /* defer_inc (inc) potem defer_dec (dec); wyczysc */
 void gh2_txn_alloc_abort(struct gh2_txn_alloc *t);    /* cofnij txn_alloced (rc->0); porzuc defer */
+
+/* v2-ncache redukcja: op SUKCES — sfinalizuj superseded prior-op cached nodes biezacej op:
+ * usun je z cache (NIE flushuj — nie sa czescia finalnego drzewa) + zwolnij blok (rc->0; bezpieczne,
+ * bo op sukces => fs_root NIE wskazuje na nie, a disk-committed drzewo tez nie). Czysci liste.
+ * Wolane na granicy operacji (nastepny mark / commit) — dotarcie tu => poprzednia op sie udala
+ * (porazka wola rollback, ktory PORZUCA liste bez free). Idempotentne gdy lista pusta. */
+void gh2_txn_alloc_op_commit(struct gh2_txn_alloc *t);
 
 /* ---- savepoint/rollback: atomowosc per-operacja FS (wiele insert/delete na 1 alloc) ---- */
 /* Operacja FS robi wiele mutacji dzielac jeden alloc; przy bledzie w srodku trzeba cofnac

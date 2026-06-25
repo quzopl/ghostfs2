@@ -27,10 +27,19 @@ struct gh_dev { int fd; uint64_t total_blocks; struct gh_txn *txn;
                 struct gh_cipher *cipher; long fail_after;
                 uint64_t hint_block; uint64_t hint_inode; struct gh_bcache *cache;
                 int is_blkdev; uint64_t *discards; uint32_t nd; uint32_t dcap;
-                int checksums; uint64_t csum_start, csum_blocks, jrnl_start, jrnl_blocks; };
+                int checksums; uint64_t csum_start, csum_blocks, jrnl_start, jrnl_blocks;
+                void *v2_ncache; /* ghostfs v2: write-back cache brudnych wezlow (NULL=off) */ };
 
 int  gh_bcache_create(struct gh_dev *dev);
 void gh_bcache_destroy(struct gh_dev *dev);
+
+/* ---- instrumentacja zapisow (dla testow/benchmarkow; bez wplywu na zachowanie) ----
+ * gh_disk_write_count: laczna liczba zapisow na dysk (pwrite) od ostatniego resetu.
+ * gh_disk_write_watch: jesli !=0, liczy zapisy DOKLADNIE tego bloku w gh_disk_write_watch_hits.
+ * Globalne (proces); test ustawia/zeruje przed pomiarem. */
+extern unsigned long gh_disk_write_count;
+extern uint64_t      gh_disk_write_watch;
+extern unsigned long gh_disk_write_watch_hits;
 
 int  gh_dev_create(const char *path, uint64_t total_blocks, struct gh_dev *dev);
 int  gh_dev_open(const char *path, struct gh_dev *dev);

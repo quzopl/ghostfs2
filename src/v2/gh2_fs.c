@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 #define _DEFAULT_SOURCE
 #include "v2/gh2_fs.h"
+#include "v2/gh2_ncache.h"
 #include "csum.h"
 #include "crypto.h"
 #include <string.h>
@@ -153,6 +154,18 @@ static int fs_write_inode(struct gh2_fs *fs, struct gh2_bptr *root, uint64_t ino
     return fs_insert(fs, root, &k, buf, sizeof(buf));
 }
 
+/* ---- CAPACITY BOUND write-back cache ----
+ * Gdy cache brudnych wezlow przekroczy prog, wymus gh2_fs_commit (flush+SB-swap) by ograniczyc
+ * pamiec dlugiej transakcji (np. 32768 losowych zapisow gromadzacych brudne liscie). Wolane TYLKO
+ * na granicy PUBLICZNEJ operacji (fs->fs_root juz spojny) — nigdy w srodku CoW. Commit utrwala
+ * dotychczasowe mutacje (semantycznie OK: granica operacji). Blad commitu propagowany do callera. */
+#define GH2_NCACHE_CAP  4096u   /* prog brudnych wezlow (4096*4KB = 16 MB) */
+static int gh2_fs_capacity_commit(struct gh2_fs *fs) {
+    if (!fs->dev.v2_ncache) return 0;
+    if (gh2_ncache_count(fs->dev.v2_ncache) < GH2_NCACHE_CAP) return 0;
+    return gh2_fs_commit(fs);
+}
+
 /* atomowy zapis pojedynczego i-wezla (chmod/chown/utimens/truncate): savepoint+rollback. */
 static int fs_commit_one_inode(struct gh2_fs *fs, uint64_t ino, const struct gh2_inode *in) {
     struct gh2_bptr root = fs->fs_root;
@@ -160,6 +173,7 @@ static int fs_commit_one_inode(struct gh2_fs *fs, uint64_t ino, const struct gh2
     int r = fs_write_inode(fs, &root, ino, in);
     if (r) { gh2_txn_alloc_rollback(&fs->alloc, sp); return r; }
     fs->fs_root = root;
+    gh2_txn_alloc_op_commit(&fs->alloc);   /* sukces op: finalizuj superseded TEJ op (atomowosc) */
     return 0;
 }
 
@@ -679,6 +693,7 @@ int gh2_fs_test_dir_add(struct gh2_fs *fs, uint64_t parent, uint64_t hash,
     int r = dir_add_entry_hashed(fs, &root, parent, hash, name, nlen, ino, ftype);
     if (r) { gh2_txn_alloc_rollback(&fs->alloc, sp); return r; }
     fs->fs_root = root;
+    gh2_txn_alloc_op_commit(&fs->alloc);   /* sukces op: finalizuj superseded TEJ op (atomowosc) */
     return 0;
 }
 int gh2_fs_test_dir_lookup(struct gh2_fs *fs, uint64_t parent, uint64_t hash,
@@ -694,6 +709,7 @@ int gh2_fs_test_dir_remove(struct gh2_fs *fs, uint64_t parent, const char *name,
     int r = dir_remove_entry(fs, &root, parent, name, nlen);
     if (r) { gh2_txn_alloc_rollback(&fs->alloc, sp); return r; }
     fs->fs_root = root;
+    gh2_txn_alloc_op_commit(&fs->alloc);   /* sukces op: finalizuj superseded TEJ op (atomowosc) */
     return 0;
 }
 
@@ -839,7 +855,8 @@ int gh2_fs_test_xattr_set_hashed(struct gh2_fs *fs, uint64_t ino, uint64_t hash,
     r = fs_insert(fs, &root, &k, nv, nl);
     if (r) { gh2_txn_alloc_rollback(&fs->alloc, sp); return r; }
     fs->fs_root = root;
-    return 0;
+    gh2_txn_alloc_op_commit(&fs->alloc);   /* sukces op: finalizuj superseded TEJ op (atomowosc) */
+    return gh2_fs_capacity_commit(fs);   /* capacity bound write-back cache */
 }
 ssize_t gh2_fs_test_xattr_get_hashed(struct gh2_fs *fs, uint64_t ino, uint64_t hash,
                                      const char *name, void *buf, size_t size) {
@@ -1033,6 +1050,16 @@ int gh2_fs_mount_key(struct gh2_fs *fs, struct gh_dev *dev, const char *passphra
     if (r) { gh2_space_destroy(&fs->space); goto fail_cipher; }
     fs->alloc.dup_meta = (fs->sb.flags & GH2_SB_DUP_META) ? 1 : 0;   /* v2.8: DUP z flagi SB */
     fs->compress = (fs->sb.flags & GH2_SB_COMPRESS) ? 1 : 0;          /* v2.9: sciezka chunk extentow */
+    /* WRITE-BACK cache brudnych wezlow (per-montaz): brudne wezly w pamieci, flush przy commit.
+     * dev->v2_ncache widziany przez gh2_node_write/read; alloc.ncache przez free vtable. */
+    fs->dev.v2_ncache = gh2_ncache_create();
+    if (!fs->dev.v2_ncache) {
+        gh2_txn_alloc_destroy(&fs->alloc);
+        gh2_space_destroy(&fs->space);
+        r = -ENOMEM;
+        goto fail_cipher;
+    }
+    fs->alloc.ncache = fs->dev.v2_ncache;
     return 0;
 
 fail_cipher:
@@ -1050,6 +1077,13 @@ int gh2_fs_mount(struct gh2_fs *fs, struct gh_dev *dev) {
 }
 
 void gh2_fs_unmount(struct gh2_fs *fs) {
+    /* WRITE-BACK: porzuc brudne wezly w pamieci (niezacommitowane mutacje gina, jak v1 bez
+     * commitu). gh_disk_write NIE wolany — bezpieczne: SB wciaz wskazuje stary, spojny stan. */
+    if (fs->dev.v2_ncache) {
+        gh2_ncache_destroy(fs->dev.v2_ncache);
+        fs->dev.v2_ncache = NULL;
+        fs->alloc.ncache = NULL;
+    }
     gh2_txn_alloc_destroy(&fs->alloc);
     gh2_space_destroy(&fs->space);
     if (fs->dev.cipher) {   /* v2enc: wymaz klucz przy odmontowaniu (brak wycieku) */
@@ -1059,6 +1093,25 @@ void gh2_fs_unmount(struct gh2_fs *fs) {
     }
     memset(&fs->fs_root, 0, sizeof(fs->fs_root));
     memset(&fs->root_tree, 0, sizeof(fs->root_tree));
+}
+
+/* ============================ flush write-back cache ============================ */
+/* Zapisz KAZDY brudny wezel z cache na dysk (gh_disk_write -> szyfrowanie + cache bloku).
+ * Przy bledzie I/O przerwij i propaguj -errno (caller robi rollback; czesc wezlow moze byc
+ * na dysku, ale nieosiagalna ze STAREGO SB -> nieszkodliwe). Cache NIE czyszczony tutaj
+ * (commit czysci po udanej podmianie SB; przy bledzie bufory zostaja do unmount). */
+struct flush_ctx { struct gh_dev *dev; int rc; };
+static int flush_one_cb(uint64_t block, const void *buf, void *ctx) {
+    struct flush_ctx *f = ctx;
+    int r = gh_disk_write(f->dev, block, buf);
+    if (r) { f->rc = r; return r; }   /* przerwij flush (propaguj blad) */
+    return 0;
+}
+static int gh2_fs_flush_ncache(struct gh2_fs *fs) {
+    if (!fs->dev.v2_ncache) return 0;
+    struct flush_ctx f = { &fs->dev, 0 };
+    int r = gh2_ncache_foreach(fs->dev.v2_ncache, flush_one_cb, &f);
+    return r ? f.rc : 0;
 }
 
 /* ============================ commit (atomowy, crash-safe) ============================ */
@@ -1091,6 +1144,20 @@ int gh2_fs_commit(struct gh2_fs *fs) {
         root_tree = nrt;
     }
 
+    /* Faza 0 udana: sfinalizuj superseded prior-op cached nodes (z ostatnich operacji ORAZ z CoW
+     * drzewa korzeni powyzej) — usun je z cache, by FLUSH ponizej zapisal TYLKO zywe wezly finalnego
+     * drzewa (klucz redukcji: superseded korzenie/wezly NIE trafiaja na dysk). Bezpieczne: dotarlismy
+     * tu => Faza 0 sie udala (porazka wyzej zrobila rollback+return, porzucajac superseded). */
+    gh2_txn_alloc_op_commit(&fs->alloc);
+
+    /* --- Faza 0.5: FLUSH write-back cache --- zapisz WSZYSTKIE brudne wezly (finalne drzewo
+       korzeni + fs-tree) na dysk PRZED bariera/SB. Szyfrowanie nastepuje tu (gh_disk_write).
+       Wezly posrednie (CoW nadpisane) zostaly usuniete z cache przy free -> NIE sa zapisywane.
+       Po sukcesie cache wciaz trzyma bufory (czyscimy po fazie 2 — gdyby commit padl przed
+       podmiana SB, remount odbuduje ze STAREGO SB; brudne bufory porzucone przy unmount). */
+    r = gh2_fs_flush_ncache(fs);
+    if (r) { gh2_txn_alloc_rollback(&fs->alloc, sp); return r; }
+
     /* --- Faza 1: bariera danych --- nowe bloki (wezly fs-tree + drzewa korzeni + bloki danych)
        trwale na dysku PRZED zapisem superbloku. */
     if (fsync(fs->dev.fd)) { gh2_txn_alloc_rollback(&fs->alloc, sp); return -EIO; }
@@ -1105,6 +1172,10 @@ int gh2_fs_commit(struct gh2_fs *fs) {
         return r;
     }
     fs->root_tree = root_tree;  /* utrwalone -> przyjmij nowy korzen drzewa korzeni */
+
+    /* WRITE-BACK: brudne wezly sa juz trwale na dysku (faza 0.5) i osiagalne z nowego SB.
+       Wyczysc cache (zwolnij bufory) — nastepna transakcja zaczyna od pustego. */
+    if (fs->dev.v2_ncache) gh2_ncache_clear(fs->dev.v2_ncache);
 
     /* --- Faza 3: zwolnienie starych blokow CoW --- teraz nieosiagalne; tylko w pamieci
        (mark-sweep przy mount i tak odbuduje mape). Po udanej fazie 2 -> stan NOWY trwaly. */
@@ -1566,7 +1637,8 @@ static int fs_make(struct gh2_fs *fs, const char *path, uint16_t mode, uint8_t f
 
     fs->fs_root = root;
     fs->next_ino = ino + 1;
-    return 0;
+    gh2_txn_alloc_op_commit(&fs->alloc);   /* sukces op: finalizuj superseded TEJ op (atomowosc) */
+    return gh2_fs_capacity_commit(fs);   /* capacity bound write-back cache */
 
 fail:
     gh2_txn_alloc_rollback(&fs->alloc, sp);
@@ -1742,7 +1814,8 @@ int gh2_fs_unlink(struct gh2_fs *fs, const char *path) {
     if (r) goto fail;
 
     fs->fs_root = root;
-    return 0;
+    gh2_txn_alloc_op_commit(&fs->alloc);   /* sukces op: finalizuj superseded TEJ op (atomowosc) */
+    return gh2_fs_capacity_commit(fs);   /* capacity bound write-back cache */
 
 fail:
     gh2_txn_alloc_rollback(&fs->alloc, sp);
@@ -1797,7 +1870,8 @@ int gh2_fs_rmdir(struct gh2_fs *fs, const char *path) {
     if (r) goto fail;
 
     fs->fs_root = root;
-    return 0;
+    gh2_txn_alloc_op_commit(&fs->alloc);   /* sukces op: finalizuj superseded TEJ op (atomowosc) */
+    return gh2_fs_capacity_commit(fs);   /* capacity bound write-back cache */
 
 fail:
     gh2_txn_alloc_rollback(&fs->alloc, sp);
@@ -1847,7 +1921,8 @@ int gh2_fs_link(struct gh2_fs *fs, const char *oldpath, const char *newpath) {
     if (r) goto fail;
 
     fs->fs_root = root;
-    return 0;
+    gh2_txn_alloc_op_commit(&fs->alloc);   /* sukces op: finalizuj superseded TEJ op (atomowosc) */
+    return gh2_fs_capacity_commit(fs);   /* capacity bound write-back cache */
 
 fail:
     gh2_txn_alloc_rollback(&fs->alloc, sp);
@@ -1906,7 +1981,8 @@ int gh2_fs_symlink(struct gh2_fs *fs, const char *target, const char *path) {
 
     fs->fs_root = root;
     fs->next_ino = ino + 1;
-    return 0;
+    gh2_txn_alloc_op_commit(&fs->alloc);   /* sukces op: finalizuj superseded TEJ op (atomowosc) */
+    return gh2_fs_capacity_commit(fs);   /* capacity bound write-back cache */
 
 fail:
     gh2_txn_alloc_rollback(&fs->alloc, sp);
@@ -1985,7 +2061,8 @@ int gh2_fs_mknod(struct gh2_fs *fs, const char *path, uint32_t mode, uint64_t rd
 
     fs->fs_root = root;
     fs->next_ino = ino + 1;
-    return 0;
+    gh2_txn_alloc_op_commit(&fs->alloc);   /* sukces op: finalizuj superseded TEJ op (atomowosc) */
+    return gh2_fs_capacity_commit(fs);   /* capacity bound write-back cache */
 
 fail:
     gh2_txn_alloc_rollback(&fs->alloc, sp);
@@ -2163,7 +2240,8 @@ int gh2_fs_rename(struct gh2_fs *fs, const char *oldpath, const char *newpath, u
     }
 
     fs->fs_root = root;
-    return 0;
+    gh2_txn_alloc_op_commit(&fs->alloc);   /* sukces op: finalizuj superseded TEJ op (atomowosc) */
+    return gh2_fs_capacity_commit(fs);   /* capacity bound write-back cache */
 
 fail:
     gh2_txn_alloc_rollback(&fs->alloc, sp);
@@ -2235,6 +2313,9 @@ ssize_t gh2_fs_write(struct gh2_fs *fs, const char *path, const void *buf, size_
     if (r) goto fail;
 
     fs->fs_root = root;
+    gh2_txn_alloc_op_commit(&fs->alloc);   /* sukces op: finalizuj superseded TEJ op (atomowosc) */
+    r = gh2_fs_capacity_commit(fs);   /* capacity bound write-back cache */
+    if (r) return r;
     return (ssize_t)len;
 
 fail:
@@ -2440,6 +2521,7 @@ int gh2_fs_truncate(struct gh2_fs *fs, const char *path, uint64_t size) {
         if (r) { gh2_txn_alloc_rollback(&fs->alloc, csp); return r; }
 
         fs->fs_root = croot;
+        gh2_txn_alloc_op_commit(&fs->alloc);   /* sukces op: finalizuj superseded TEJ op (atomowosc) */
         return 0;
     }
 
@@ -2511,7 +2593,8 @@ int gh2_fs_truncate(struct gh2_fs *fs, const char *path, uint64_t size) {
     if (r) goto fail;
 
     fs->fs_root = root;
-    return 0;
+    gh2_txn_alloc_op_commit(&fs->alloc);   /* sukces op: finalizuj superseded TEJ op (atomowosc) */
+    return gh2_fs_capacity_commit(fs);   /* capacity bound write-back cache */
 
 fail:
     gh2_txn_alloc_rollback(&fs->alloc, sp);
@@ -2589,7 +2672,8 @@ int gh2_fs_setxattr(struct gh2_fs *fs, const char *path, const char *name,
     r = fs_insert(fs, &root, &k, nv, nl);
     if (r) { gh2_txn_alloc_rollback(&fs->alloc, sp); return r; }
     fs->fs_root = root;
-    return 0;
+    gh2_txn_alloc_op_commit(&fs->alloc);   /* sukces op: finalizuj superseded TEJ op (atomowosc) */
+    return gh2_fs_capacity_commit(fs);   /* capacity bound write-back cache */
 }
 
 ssize_t gh2_fs_getxattr(struct gh2_fs *fs, const char *path, const char *name,
@@ -2706,7 +2790,8 @@ int gh2_fs_removexattr(struct gh2_fs *fs, const char *path, const char *name) {
     }
     if (r) { gh2_txn_alloc_rollback(&fs->alloc, sp); return r; }
     fs->fs_root = root;
-    return 0;
+    gh2_txn_alloc_op_commit(&fs->alloc);   /* sukces op: finalizuj superseded TEJ op (atomowosc) */
+    return gh2_fs_capacity_commit(fs);   /* capacity bound write-back cache */
 }
 
 /* ============================ v2.5: fsck (read-only walidator) ============================ */
@@ -3045,6 +3130,7 @@ int gh2_fsck(struct gh2_fs *fs, int repair, int *issues) {
         if (pr == 0 && fs->alloc.oom) pr = -ENOMEM;
         if (pr) { gh2_txn_alloc_rollback(&fs->alloc, sp); rc = pr; goto done; }
         fs->fs_root = root;   /* sukces: caller robi gh2_fs_commit dla trwalosci */
+        gh2_txn_alloc_op_commit(&fs->alloc);   /* sukces op: finalizuj superseded TEJ op (atomowosc) */
     }
 
 done:

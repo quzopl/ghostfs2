@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #include "v2/gh2_space.h"
+#include "v2/gh2_ncache.h"   /* write-back cache: immediate-free brudnych wezlow this-txn */
 #include "v2/gh2_format.h"   /* GH2_SB_SLOT_A/B, GH2_DATA_START */
 #include "v2/gh2_fs.h"       /* GH2_EXTENT_DATA, struct gh2_extent (mark-sweep blokow danych) */
 #include <stdlib.h>
@@ -110,8 +111,11 @@ int gh2_txn_alloc_init(struct gh2_txn_alloc *t, struct gh2_space *s) {
     t->defer_dec = NULL; t->ndd = 0; t->ddcap = 0;
     t->defer_inc = NULL; t->ndi = 0; t->dicap = 0;
     t->txn_alloced = NULL; t->nta = 0; t->tacap = 0;
+    t->superseded = NULL; t->nss = 0; t->sscap = 0;
     t->oom = 0;
     t->dup_meta = 0;        /* DUP off domyslnie; gh2_fs ustawia z flagi SB GH2_SB_DUP_META */
+    t->ncache = NULL;       /* write-back off domyslnie; gh2_fs ustawia z dev->v2_ncache */
+    t->op_floor = 0;        /* poczatek biezacej operacji (ustawiany przez gh2_txn_alloc_mark) */
     return 0;
 }
 
@@ -119,6 +123,7 @@ void gh2_txn_alloc_destroy(struct gh2_txn_alloc *t) {
     free(t->defer_dec);   t->defer_dec = NULL;   t->ndd = 0; t->ddcap = 0;
     free(t->defer_inc);   t->defer_inc = NULL;   t->ndi = 0; t->dicap = 0;
     free(t->txn_alloced); t->txn_alloced = NULL; t->nta = 0; t->tacap = 0;
+    free(t->superseded);  t->superseded = NULL;  t->nss = 0; t->sscap = 0;
 }
 
 /* dopisz blk do dynamicznej tablicy; 0 OK, -ENOMEM przy braku pamieci */
@@ -150,12 +155,48 @@ static int txn_alloc_fn(void *ctx, uint64_t *out_block) {
     return 0;
 }
 
-/* free vtable = push defer_dec (DEFER dec do commitu; NIE zwalnia od razu — zywe drzewo wciaz
- * na blok wskazuje). Przy commit: ref_dec (zwolni przy rc 0). Przy OOM: blok ZOSTAJE (wyciek,
- * nie korupcja), flaga oom. Bez wspoldzielenia (rc==1): dec 1->0 zwalnia == stary defer_free. */
+/* czy `block` zostal zaalokowany w BIEZACEJ operacji (txn_alloced[op_floor..nta))? Tylko taki
+ * brudny wezel mozna immediate-free: rollback biezacej op i tak go cofnie (nie jest czescia
+ * stanu sprzed operacji). Brudny wezel z POPRZEDNIEJ op (tej samej txn) jest czescia stanu
+ * sprzed op -> rollback musi go odtworzyc -> defer (zostaje w cache, blok niereuzyty). */
+static int block_is_this_op(const struct gh2_txn_alloc *t, uint64_t block) {
+    for (uint32_t i = t->op_floor; i < t->nta; i++)
+        if (t->txn_alloced[i] == block) return 1;
+    return 0;
+}
+
+/* free vtable. Trzy sciezki:
+ *   (a) WRITE-BACK + blok W cache + alokowany w BIEZACEJ operacji (this-op fresh): usun z cache
+ *       (bufor wezla NIGDY nie trafi na dysk) + zwolnij blok NATYCHMIAST (rc->0 -> reuse w tej
+ *       txn). Eliminuje zapis wezlow posrednich ORAZ pozwala reuzyc ich bloki. Bezpieczne:
+ *       rollback biezacej op cofa te alokacje; stan sprzed op nie wskazuje na ten blok.
+ *   (b) WRITE-BACK + blok W cache, ale z POPRZEDNIEJ op tej samej txn (superseded prior-op): wezel
+ *       ZOSTAJE w cache NA RAZIE (rollback-safety: rollback biezacej op przywroci *root sprzed op,
+ *       ktory moze nan wskazywac — bufor musi byc odczytywalny), a blok NIE jest reuzywany.
+ *       Dodaj do listy `superseded`. Po SUKCESIE biezacej op (gh2_txn_alloc_op_commit): usun z
+ *       cache (NIE flush — nie czesc finalnego drzewa) + zwolnij blok. Po ROLLBACK: porzuc (zostaje).
+ *       KLUCZ REDUKCJI: bez tego superseded korzenie/wezly akumulowaly sie w cache i byly flushowane
+ *       przy commicie -> brak redukcji zapisow. Teraz finalny flush pisze tylko ZYWE wezly.
+ *   (c) inaczej (committed wezel / dane / brak cache): defer_dec (jak dotad).
+ * Przy OOM listy: blok ZOSTAJE (wyciek, nie korupcja), flaga oom. */
 static void txn_free_fn(void *ctx, uint64_t block) {
     struct gh2_txn_alloc *t = ctx;
     if (block == 0) return;   /* 0 = brak bloku */
+    struct gh2_ncache *nc = t->ncache;
+    if (nc && gh2_ncache_has(nc, block)) {
+        if (block_is_this_op(t, block)) {
+            gh2_ncache_remove(nc, block);      /* wezel posredni biezacej op: nigdy na dysk */
+            gh2_space_set(t->space, block, 0); /* immediate free (rc->0): reuse w tej txn */
+            return;
+        }
+        /* (b) superseded prior-op cached node: zostaw w cache (rollback-safety), zapisz na liste.
+         * NIE defer_dec (op_commit zwolni blok po sukcesie; rollback porzuci). Blok pozostaje
+         * zajety do op_commit -> stan spojny niezaleznie od wyniku op. */
+        if (push_block(&t->superseded, &t->nss, &t->sscap, block) != 0)
+            t->oom = 1;        /* nie pamietamy -> wezel zostanie sflushowany (brak redukcji, nie korupcja) */
+        return;
+    }
+    /* committed wezel LUB dane LUB brak cache: defer dec (blok zostaje do commit). Commit: ref_dec. */
     if (push_block(&t->defer_dec, &t->ndd, &t->ddcap, block) != 0)
         t->oom = 1;            /* nie pamietamy -> blok wyciekl (wciaz zajety), ale spojnie */
 }
@@ -195,21 +236,55 @@ int gh2_txn_alloc_commit(struct gh2_txn_alloc *t) {
     t->ndi = 0;
     t->ndd = 0;
     t->nta = 0;
+    t->nss = 0;   /* superseded juz sfinalizowane (op_commit przed flushem); defensywnie wyczysc */
     return 0;
 }
 
-/* abort: cofnij alokacje tej transakcji (rc->0, przywroc mape); PORZUC defer_dec i defer_inc */
+/* cofnij blok zaalokowany w txn: zwolnij w mapie (rc->0). WRITE-BACK: usun tez ewentualny
+ * brudny bufor z cache — blok wraca do puli wolnych i moze byc REUZYTY (np. jako blok danych
+ * pisany bezposrednio na dysk); stary bufor wezla w cache zostalby blednie sflushowany na
+ * commit, nadpisujac reuzyta tresc. */
+static void txn_undo_alloc(struct gh2_txn_alloc *t, uint64_t blk) {
+    gh2_space_set(t->space, blk, 0);
+    if (t->ncache) gh2_ncache_remove(t->ncache, blk);
+}
+
+/* abort: cofnij alokacje tej transakcji (rc->0, przywroc mape); PORZUC defer_dec i defer_inc.
+ * superseded: porzuc liste — wezly ZOSTAJA w cache (abort przywraca caly stan transakcji). */
 void gh2_txn_alloc_abort(struct gh2_txn_alloc *t) {
     for (uint32_t i = 0; i < t->nta; i++)
-        gh2_space_set(t->space, t->txn_alloced[i], 0);   /* rc->0 */
+        txn_undo_alloc(t, t->txn_alloced[i]);   /* rc->0 + usun z cache */
     t->nta = 0;
     t->ndd = 0;
     t->ndi = 0;
+    t->nss = 0;
 }
 
-/* savepoint: zapamietaj biezace dlugosci list (granica miedzy operacjami) */
+/* op SUKCES: sfinalizuj superseded prior-op cached nodes biezacej op. Dla kazdego bloku:
+ * usun bufor z cache (NIGDY nie trafi na dysk — nie jest czescia finalnego drzewa) + zwolnij
+ * blok (set 0 -> rc->0). Bezpieczne bo: op sie udala (fs_root=nowy, NIE wskazuje na superseded);
+ * wezel byl tylko w cache (nigdy nieflushowany) -> nie na dysku; disk-committed drzewo (sprzed
+ * tej op, z poprzedniego gh2_fs_commit) tez go nie wskazuje (nowszy niz disk). => brak referencji
+ * => wolny. Wyczysc liste. Wolane na granicy operacji gdy poprzednia op sie UDALA. */
+void gh2_txn_alloc_op_commit(struct gh2_txn_alloc *t) {
+    struct gh2_ncache *nc = t->ncache;
+    for (uint32_t i = 0; i < t->nss; i++) {
+        uint64_t blk = t->superseded[i];
+        if (nc) gh2_ncache_remove(nc, blk);   /* nie flushuj martwego wezla */
+        gh2_space_set(t->space, blk, 0);      /* zwolnij blok (rc->0) */
+    }
+    t->nss = 0;
+}
+
+/* savepoint: zapamietaj biezace dlugosci list (granica miedzy operacjami). Ustaw op_floor =
+ * nta -> bloki alokowane OD TERAZ sa "this-op fresh" (immediate-free dozwolony przy write-back).
+ * NIE finalizuje superseded — atomowosc per-op: finalizacja superseded nalezy do SUKCESU WLASNEJ
+ * operacji (gh2_txn_alloc_op_commit wolane TUZ PO fs->fs_root=root w gh2_fs.c), NIE do startu
+ * nastepnej. Dzieki temu NIEUDANA op (ktora i tak robi mark) NIE zwalnia superseded poprzedniej
+ * udanej op -> mapa/fs_root niezmienione przy bledzie (atomowosc). */
 struct gh2_txn_savepoint gh2_txn_alloc_mark(struct gh2_txn_alloc *t) {
     struct gh2_txn_savepoint sp = { t->nta, t->ndd, t->ndi };
+    t->op_floor = t->nta;
     return sp;
 }
 
@@ -218,10 +293,13 @@ struct gh2_txn_savepoint gh2_txn_alloc_mark(struct gh2_txn_alloc *t) {
  * Wczesniejsze bloki (przed sp) pozostaja nietkniete. */
 void gh2_txn_alloc_rollback(struct gh2_txn_alloc *t, struct gh2_txn_savepoint sp) {
     for (uint32_t i = sp.nta; i < t->nta; i++)
-        gh2_space_set(t->space, t->txn_alloced[i], 0);   /* rc->0 */
+        txn_undo_alloc(t, t->txn_alloced[i]);   /* rc->0 + usun z cache (reuse-safe) */
     t->nta = sp.nta;
     t->ndd = sp.ndd;
     t->ndi = sp.ndi;
+    /* PORZUC superseded biezacej op: wezly ZOSTAJA w cache (NIE usunieto/zwolniono w free vtable);
+     * stary fs_root (przywracany przez callera) moze nan wskazywac -> musza przezyc, czytelne. */
+    t->nss = 0;
 }
 
 /* ============================ mark-sweep ============================ */

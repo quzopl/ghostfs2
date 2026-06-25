@@ -26,6 +26,7 @@ int gh_dev_create(const char *path, uint64_t total_blocks, struct gh_dev *dev) {
     dev->is_blkdev = 0; dev->discards = NULL; dev->nd = 0; dev->dcap = 0;
     dev->checksums = 0; dev->csum_start = 0; dev->csum_blocks = 0;
     dev->jrnl_start = 0; dev->jrnl_blocks = 0;
+    dev->v2_ncache = NULL;
     return 0;
 }
 
@@ -53,6 +54,7 @@ int gh_dev_open(const char *path, struct gh_dev *dev) {
     dev->is_blkdev = is_blk; dev->discards = NULL; dev->nd = 0; dev->dcap = 0;
     dev->checksums = 0; dev->csum_start = 0; dev->csum_blocks = 0;
     dev->jrnl_start = 0; dev->jrnl_blocks = 0;
+    dev->v2_ncache = NULL;
     return 0;
 }
 
@@ -143,11 +145,18 @@ int gh_disk_read(struct gh_dev *dev, uint64_t blkno, void *buf) {
     return 0;
 }
 
+/* instrumentacja zapisow (testy/benchmarki) — domyslnie nieaktywna (zera) */
+unsigned long gh_disk_write_count = 0;
+uint64_t      gh_disk_write_watch = 0;
+unsigned long gh_disk_write_watch_hits = 0;
+
 int gh_disk_write(struct gh_dev *dev, uint64_t blkno, const void *buf) {
     if (dev->fail_after > 0) {
         if (--dev->fail_after == 0) return -EIO;   /* symulacja awarii zapisu */
     }
     if (blkno >= dev->total_blocks) return -EINVAL;
+    gh_disk_write_count++;
+    if (gh_disk_write_watch != 0 && blkno == gh_disk_write_watch) gh_disk_write_watch_hits++;
     off_t off = (off_t)blkno * GH_BLOCK_SIZE;
     if (dev->cipher && blkno != 0) {
         uint8_t tmp[GH_BLOCK_SIZE];

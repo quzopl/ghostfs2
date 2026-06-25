@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #include "v2/gh2_btree.h"
+#include "v2/gh2_ncache.h"
 #include "csum.h"
 #include <string.h>
 #include <stdlib.h>
@@ -105,6 +106,15 @@ static int gh2_node_validate(const void *buf) {
 
 int gh2_node_read(struct gh_dev *dev, const struct gh2_bptr *bptr, void *buf) {
     if (bptr->block == 0) return -EINVAL;
+    struct gh2_ncache *nc = dev->v2_ncache;
+    /* WRITE-BACK: brudny wezel tej transakcji jest w cache (jeszcze nie na dysku).
+     * READ-YOUR-WRITES: czytaj z pamieci. Walidacja struktury jak dla odczytu z dysku
+     * (csum pomijamy — bufor w cache jest plaintextem zapisanym przez gh2_node_write). */
+    if (nc) {
+        if (gh2_ncache_get(nc, bptr->block, buf)) return gh2_node_validate(buf);
+        if (bptr->dup_block != 0 && gh2_ncache_get(nc, bptr->dup_block, buf))
+            return gh2_node_validate(buf);
+    }
     int r = gh_disk_read(dev, bptr->block, buf);
     if (r == 0 && gh_crc32(buf, GH2_BLOCK_SIZE) == bptr->csum)
         return gh2_node_validate(buf);
@@ -128,10 +138,13 @@ int gh2_node_read(struct gh_dev *dev, const struct gh2_bptr *bptr, void *buf) {
 
 int gh2_node_write(struct gh_dev *dev, struct gh2_alloc *a, const void *buf,
                    uint64_t gen, struct gh2_bptr *out_bptr) {
+    struct gh2_ncache *nc = dev->v2_ncache;
     uint64_t blk;
     int r = a->alloc(a->ctx, &blk);
     if (r) return r;
-    r = gh_disk_write(dev, blk, buf);
+    /* WRITE-BACK: wstaw bufor (kopia 4096B) do cache zamiast gh_disk_write. Flush -> commit. */
+    if (nc) r = gh2_ncache_put(nc, blk, buf);
+    else    r = gh_disk_write(dev, blk, buf);
     if (r) { a->free(a->ctx, blk); return r; }
     uint64_t blk2 = 0;
     if (a->dup_meta) {
@@ -139,7 +152,8 @@ int gh2_node_write(struct gh_dev *dev, struct gh2_alloc *a, const void *buf,
          * 2. kopii -> zwolnij OBA bloki i zwroc blad (atomowo: brak polowicznego wezla). */
         r = a->alloc(a->ctx, &blk2);
         if (r) { a->free(a->ctx, blk); return r; }
-        r = gh_disk_write(dev, blk2, buf);
+        if (nc) r = gh2_ncache_put(nc, blk2, buf);
+        else    r = gh_disk_write(dev, blk2, buf);
         if (r) { a->free(a->ctx, blk2); a->free(a->ctx, blk); return r; }
     }
     memset(out_bptr, 0, sizeof(*out_bptr));
