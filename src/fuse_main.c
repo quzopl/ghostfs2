@@ -17,6 +17,10 @@
 
 static struct gfs g_fs;
 static int g_lock_fd = -1;
+/* Efektywny max_read przekazany do fuse_session_new (nasz domyslny 1 MiB
+   LUB user override z -o max_read=N). gf_init MUSI ustawic conn->max_read na
+   te sama wartosc — libfuse3 wymaga zgodnosci init() i fuse_session_new(). */
+static unsigned g_max_read = 1u << 20;
 
 static pthread_rwlock_t g_lock;
 
@@ -205,14 +209,17 @@ static int gf_removexattr(const char *path, const char *name) {
 /* strojenie I/O: wieksze zapisy (mniej round-tripow), splice (zero-copy),
    writeback cache (jadro scala zapisy sekwencyjne). Negocjowane z jadrem (want & capable). */
 static void *gf_init(struct fuse_conn_info *conn, struct fuse_config *cfg) {
-    (void)cfg;
     if (conn->capable & FUSE_CAP_WRITEBACK_CACHE) conn->want |= FUSE_CAP_WRITEBACK_CACHE;
     if (conn->capable & FUSE_CAP_SPLICE_WRITE)     conn->want |= FUSE_CAP_SPLICE_WRITE;
     if (conn->capable & FUSE_CAP_SPLICE_READ)      conn->want |= FUSE_CAP_SPLICE_READ;
     if (conn->capable & FUSE_CAP_SPLICE_MOVE)      conn->want |= FUSE_CAP_SPLICE_MOVE;
-    conn->max_write = 1u << 20;   /* 1 MiB: 8x mniej round-tripow dla duzych zapisow.
-       (max_read NIE ustawiamy w init — w libfuse3 musi zgadzac sie z -o max_read=
-       z fuse_session_new, inaczej blad; dla zapisu nieistotny) */
+    conn->max_write = 1u << 20;   /* 1 MiB: 8x mniej round-tripow dla duzych zapisow. */
+    conn->max_read = g_max_read;  /* tnie round-tripy ODCZYTU (jadro domyslnie ~128 KiB);
+       == wartosc -o max_read (nasz 1 MiB lub user override) — libfuse3 wymaga zgodnosci. */
+    conn->max_readahead = 8u << 20; /* 8 MiB prefetch: pipeline'uje sekwencyjny odczyt
+       (nakladanie latencji FUSE na konsumpcje aplikacji). */
+    cfg->auto_cache = 1;          /* retencja page-cache + auto-inwalidacja po mtime/size:
+       koherentny re-odczyt (single-writer + flock — swieza tresc po nadpisaniu). */
     return NULL;
 }
 
@@ -255,11 +262,46 @@ int main(int argc, char **argv) {
         gfs_unmount(&g_fs); flock(g_lock_fd, LOCK_UN); close(g_lock_fd); return 1;
     }
 
-    /* przekaz do FUSE argv bez nazwy kontenera (argv[1]) */
-    int fargc = argc - 1;
+    /* przekaz do FUSE argv bez nazwy kontenera (argv[1]).
+       Jesli user nie podal max_read -> wstrzykujemy -o max_read=1048576 (1 MiB,
+       zgodne z conn->max_read w gf_init): ustawia rozmiar zadan odczytu w
+       fuse_session_new. Jesli podal -> uszanuj override, nie dubluj. */
+    /* Skanuj WYLACZNIE optstringi FUSE (-o ...), NIE argumenty pozycyjne
+       (mountpoint moze zawierac podciag "max_read") ani inne flagi.
+       Optstring to lista po przecinkach; szukamy TOKENU "max_read=" (z '='
+       zaraz po nazwie, by NIE lapac "max_readahead="). */
+    int user_max_read = 0;
+    for (int i = 2; i < argc; i++) {
+        const char *opt = NULL;
+        if (strcmp(argv[i], "-o") == 0) {       /* -o <optstring>: optstring = nastepny argv */
+            if (i + 1 >= argc) break;           /* NULL-safe: brak wartosci po -o */
+            opt = argv[++i];
+        } else if (argv[i][0] == '-' && argv[i][1] == 'o' && argv[i][2] != '\0') {
+            opt = argv[i] + 2;                  /* -o<optstring> sklejone */
+        } else {
+            continue;                           /* mountpoint / -f / -s / -d ... pomijamy */
+        }
+        /* przejdz tokeny optstringu rozdzielone przecinkami */
+        const char *tok = opt;
+        while (tok) {
+            if (strncmp(tok, "max_read=", 9) == 0) {  /* dokladny token, NIE max_readahead= */
+                user_max_read = 1;
+                unsigned long v = strtoul(tok + 9, NULL, 10);
+                if (v > 0) g_max_read = (unsigned)v; /* zgodnosc gf_init <-> sesja */
+            }
+            const char *c = strchr(tok, ',');
+            tok = c ? c + 1 : NULL;
+        }
+    }
+
+    int fargc = argc - 1 + (user_max_read ? 0 : 2);
     char **fargv = malloc(sizeof(char*) * (size_t)fargc);
     fargv[0] = argv[0];
     for (int i = 2; i < argc; i++) fargv[i-1] = argv[i];
+    if (!user_max_read) {           /* domyslnie 1 MiB (g_max_read juz = 1<<20) */
+        fargv[argc-1] = "-o";
+        fargv[argc]   = "max_read=1048576";
+    }
 
     int rc = fuse_main(fargc, fargv, &ops, NULL);
     gfs_sync(&g_fs);          /* utrwal stan przed odmontowaniem (leniwy flush) */

@@ -12,8 +12,8 @@ trap cleanup EXIT
 
 ok() { if eval "$1"; then echo "OK: $2"; else echo "FAIL: $2"; exit 1; fi; }
 
-# format2 -> kontener v2
-"$CLI" format2 "$CONT" 16384
+# format2 -> kontener v2 (rozmiar musi pomiescic plik testowy >=64 MiB + metadane)
+"$CLI" format2 "$CONT" 49152
 ok 'true' 'format2 (v2 CoW B-tree)'
 
 "$GFS" "$CONT" "$MNT" -f &
@@ -24,6 +24,84 @@ head -c 5000000 /dev/urandom > /tmp/ghost_v2_big.bin
 cp /tmp/ghost_v2_big.bin "$MNT/big.bin"
 cp "$MNT/big.bin" /tmp/ghost_v2_big.out
 ok 'diff -q /tmp/ghost_v2_big.bin /tmp/ghost_v2_big.out >/dev/null' 'big round-trip (v2 FUSE)'
+
+# 1b) round-trip DUZEGO pliku >=64 MiB przez strojony mount (wymusza wielo-MiB
+#     odczyty z nowym max_read=1MiB; sha256 zrodlo == odczyt, bajt-exact)
+head -c 67108864 /dev/urandom > /tmp/ghost_v2_huge.bin
+cp /tmp/ghost_v2_huge.bin "$MNT/huge.bin"
+sync
+SRC_SHA=$(sha256sum /tmp/ghost_v2_huge.bin | awk '{print $1}')
+MNT_SHA=$(sha256sum "$MNT/huge.bin" | awk '{print $1}')
+ok '[ "$SRC_SHA" = "$MNT_SHA" ]' 'big-file >=64MiB round-trip sha256 bajt-exact (max_read 1MiB)'
+
+# 1c) re-odczyt: auto_cache koherencja — nadpisanie widzi swieza tresc (nie cache)
+echo aaaa > "$MNT/rc"
+ok '[ "$(cat "$MNT/rc")" = "aaaa" ]' 're-odczyt: pierwsza tresc (aaaa)'
+echo bbbb > "$MNT/rc"
+ok '[ "$(cat "$MNT/rc")" = "bbbb" ]' 're-odczyt: auto_cache koherentny po nadpisaniu (bbbb, nie cache)'
+
+# 1d) user override max_read: mount z -o max_read=131072 NIE jest dublowany
+#     i poprawnie montuje (init==session); osobny kontener/mount by nie kolidowac
+OCONT=$(mktemp /tmp/ghost_v2ovr.XXXXXX.gfs); OMNT=$(mktemp -d)
+"$CLI" format2 "$OCONT" 16384 >/dev/null
+"$GFS" "$OCONT" "$OMNT" -o max_read=131072 -f &
+OPID=$!; sleep 1
+ok 'mountpoint -q "$OMNT"' 'override -o max_read=131072 montuje (respekt, brak dublowania)'
+echo ovr > "$OMNT/o.txt"
+ok '[ "$(cat "$OMNT/o.txt")" = "ovr" ]' 'override mount round-trip'
+fusermount3 -u "$OMNT" 2>/dev/null || true; wait $OPID 2>/dev/null || true
+rm -f "$OCONT"; rmdir "$OMNT" 2>/dev/null || true
+
+# 1e) REGRESJA: mountpoint z podciagiem "max_read" w nazwie montuje DOMYSLNIE.
+#     Dawniej skan strstr(argv,"max_read") falszywie wykrywal "user podal max_read"
+#     na pozycyjnym mountpoincie -> POMIJAL wstrzykniecie -o max_read=1048576 ->
+#     sesja max_read=0 vs gf_init conn->max_read=1MiB -> libfuse3 ODRZUCAL montaz
+#     ("different maximum read size"). Teraz skanujemy tylko optstringi -o.
+RCONT=$(mktemp /tmp/ghost_v2mr.XXXXXX.gfs)
+RMNT="$(dirname "$(mktemp -d)")/ghost_max_read_dir.$$"; mkdir -p "$RMNT"
+"$CLI" format2 "$RCONT" 16384 >/dev/null
+"$GFS" "$RCONT" "$RMNT" -f &  # DOMYSLNIE: bez -o, injekcja MUSI zadzialac
+RPID=$!; sleep 1
+ok 'mountpoint -q "$RMNT"' 'mountpoint z "max_read" w nazwie montuje (regresja bug skanu)'
+echo regres > "$RMNT/r.txt"
+ok '[ "$(cat "$RMNT/r.txt")" = "regres" ]' 'mountpoint-"max_read" round-trip (brak different-read-size)'
+fusermount3 -u "$RMNT" 2>/dev/null || true; wait $RPID 2>/dev/null || true
+rm -f "$RCONT"; rmdir "$RMNT" 2>/dev/null || true
+
+# 1f) override sklejony/combined: token max_read= rozpoznany w optstringu z lista
+#     po przecinkach -> g_max_read poprawny, init==session, montuje (brak different
+#     maximum read size). Linia mount pokazuje efektywny max_read przekazany sesji.
+#     (default_permissions wlacza egzekucje uprawnien jadra — nie robimy zapisu w tym
+#     wariancie; istotne jest, ze TOKEN max_read parsuje sie z combined optstringu.)
+combo_mount() {  # $1=optstring  $2=oczekiwany max_read w linii mount  $3=etykieta
+    local XCONT XMNT XPID LINE
+    XCONT=$(mktemp /tmp/ghost_v2x.XXXXXX.gfs); XMNT=$(mktemp -d)
+    "$CLI" format2 "$XCONT" 16384 >/dev/null
+    "$GFS" "$XCONT" "$XMNT" -o "$1" -f &
+    XPID=$!; sleep 1
+    LINE=$(mount | grep " $XMNT " || true)
+    ok 'mountpoint -q "$XMNT"' "$3 montuje (init==session)"
+    ok "echo \"$LINE\" | grep -q 'max_read=$2'" "$3 -> g_max_read=$2 (token z optstringu)"
+    fusermount3 -u "$XMNT" 2>/dev/null || true; wait $XPID 2>/dev/null || true
+    rm -f "$XCONT"; rmdir "$XMNT" 2>/dev/null || true
+}
+combo_mount "max_read=262144"                     262144  "override -o max_read=262144"
+combo_mount "max_read=262144,auto_unmount"        262144  "combined -o max_read=262144,auto_unmount"
+combo_mount "default_permissions,max_read=131072" 131072  "combined -o default_permissions,max_read=131072"
+
+# 1g) max_readahead NIE jest my3one z max_read: token max_read= wymaga '=' tuz po
+#     nazwie, wiec "max_readahead=" NIE tlumi injekcji -> g_max_read pozostaje 1 MiB
+#     (init==session). FUSE moze odrzucic samo max_readahead jako opcje -o, ale nasza
+#     logika skanu NIE pudluje (brak "different maximum read size").
+YCONT=$(mktemp /tmp/ghost_v2y.XXXXXX.gfs); YMNT=$(mktemp -d)
+"$CLI" format2 "$YCONT" 16384 >/dev/null
+"$GFS" "$YCONT" "$YMNT" -o max_readahead=1048576 -f >/tmp/ghost_v2y.log 2>&1 &
+YPID=$!; sleep 1
+# kluczowe: niezaleznie czy FUSE przyjmie max_readahead, NIE ma niespojnosci read-size
+ok '! grep -qi "different maximum read size" /tmp/ghost_v2y.log' \
+   'max_readahead NIE tlumi injekcji (brak different-read-size; g_max_read=1MiB)'
+fusermount3 -u "$YMNT" 2>/dev/null || true; wait $YPID 2>/dev/null || true
+rm -f "$YCONT" /tmp/ghost_v2y.log; rmdir "$YMNT" 2>/dev/null || true
 
 # 2) katalogi zagniezdzone
 mkdir -p "$MNT/a/b/c"
@@ -211,7 +289,7 @@ fusermount3 -u "$MNT"; wait $FPID 2>/dev/null || true
 ok 'GHOSTFS_KEY="tajne-haslo-integ" "$CLI" ls "$ECONT" / | grep -q new.txt' \
    'FUSE zaszyfrowany zapis trwaly'
 
-rm -f /tmp/ghost_v2_big.bin /tmp/ghost_v2_big.out /tmp/ghost_v2cli.bin /tmp/ghost_v2cli.out \
+rm -f /tmp/ghost_v2_big.bin /tmp/ghost_v2_big.out /tmp/ghost_v2_huge.bin /tmp/ghost_v2cli.bin /tmp/ghost_v2cli.out \
       /tmp/ghost_v2snap.in /tmp/ghost_v2snap.out /tmp/ghost_v2enc.in /tmp/ghost_v2enc.out
 
 echo "WSZYSTKIE TESTY INTEGRACYJNE v2 PRZESZŁY"
